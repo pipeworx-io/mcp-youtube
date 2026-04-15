@@ -1,0 +1,20 @@
+{
+  "name": "@pipeworx/mcp-youtube",
+  "version": "0.1.0",
+  "description": "YouTube MCP — wraps the YouTube Data API v3 (BYO API key)",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "youtube"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pipeworx-io/mcp-youtube"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
