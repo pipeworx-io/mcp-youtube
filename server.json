@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pipeworx-io/youtube",
   "title": "Youtube",
-  "description": "YouTube MCP \u2014 wraps the YouTube Data API v3 (BYO API key)",
-  "version": "0.1.0",
+  "description": "YouTube MCP — wraps the YouTube Data API v3 (BYO API key)",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/youtube",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-youtube",
