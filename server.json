@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/youtube",
   "title": "Youtube",
   "description": "YouTube MCP — wraps the YouTube Data API v3 (BYO API key)",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "websiteUrl": "https://pipeworx.io/packs/youtube",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-youtube",
