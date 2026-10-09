@@ -679,6 +679,8 @@ function collapse(s: string): string {
  * - yt_channel_details: get channel info and stats
  * - yt_channel_videos: list videos from a channel
  * - yt_video_comments: get comments on a video
+ * - yt_video_transcript: caption track (timestamped segments + joined text) —
+ *   KEYLESS, via YouTube's own player endpoint, not the Data API
  */
 
 
@@ -691,6 +693,32 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
 }
 
 const BASE = 'https://www.googleapis.com/youtube/v3';
+const PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
+// The ANDROID / IOS innertube clients are the ones whose caption baseUrls fetch
+// without a PO token. The WEB watch page lists the same tracks, but its URLs carry
+// `exp=xpe` and answer 200 with a ZERO-byte body when fetched bare — a silent
+// empty transcript, which is the exact failure this tool must never return.
+// Edge-probed from a Worker 2026-10-09 (fleet #2846).
+// YouTube's datacenter bot-check ("Sign in to confirm you're not a bot") lands
+// per request, not per video: measured live through the gateway 2026-10-09 it
+// hit 7 of 10 consecutive calls and then let the same videos through. So the
+// player call rotates through two clients whose caption URLs need no PO token
+// (ANDROID_VR does NOT qualify — it is bot-checked on every probe), then
+// repeats both carrying the visitor id the public watch page hands out.
+const PLAYER_CLIENTS: { context: Record<string, unknown>; ua: string }[] = [
+  {
+    context: { clientName: 'ANDROID', clientVersion: '20.10.38', androidSdkVersion: 34, hl: 'en' },
+    ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip',
+  },
+  {
+    context: { clientName: 'IOS', clientVersion: '20.10.4', deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.3.2.22D82', hl: 'en' },
+    ua: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+  },
+];
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36';
+const TRANSCRIPT_MAX_CHARS_DEFAULT = 50_000;
+const TRANSCRIPT_MAX_CHARS_CAP = 200_000;
 
 // ── Tool definitions ──────────────────────────────────────────────────
 
@@ -805,6 +833,34 @@ const tools: McpToolExport['tools'] = [
         },
       },
       required: ['_apiKey', 'video_id'],
+    },
+  },
+  {
+    name: 'yt_video_transcript',
+    description:
+      'Get the transcript (captions) of a YouTube video: timestamped segments plus the joined text, the caption language, and whether the track is auto-generated. No API key needed. Use it to summarize, quote or search what is said in a video. Long videos are paged: pass the returned next_start_seconds as start_seconds to continue. A video with no captions returns a captions_unavailable error, never an empty transcript.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        video_id: {
+          type: 'string',
+          description: 'YouTube video ID (e.g. "dQw4w9WgXcQ") or a full youtube.com / youtu.be URL',
+        },
+        lang: {
+          type: 'string',
+          description:
+            'Caption language code (e.g. "en", "fr", "pt-BR"). "en" also matches "en-US". Default: the video\'s default caption track. If the video has no track in this language the error lists the ones it has.',
+        },
+        start_seconds: {
+          type: 'number',
+          description: 'Skip segments that start before this many seconds (for paging through long videos). Default 0.',
+        },
+        max_chars: {
+          type: 'number',
+          description: `Stop after this many characters of transcript text (default ${TRANSCRIPT_MAX_CHARS_DEFAULT}, max ${TRANSCRIPT_MAX_CHARS_CAP}).`,
+        },
+      },
+      required: ['video_id'],
     },
   },
 ];
@@ -1084,9 +1140,233 @@ async function videoComments(key: string, videoId: string, maxResults?: number, 
   };
 }
 
+// ── Transcript (keyless) ─────────────────────────────────────────────
+
+interface CaptionTrack {
+  baseUrl: string;
+  languageCode: string;
+  kind?: string;
+  name?: { simpleText?: string; runs?: { text: string }[] };
+}
+
+interface PlayerResponse {
+  playabilityStatus?: { status?: string; reason?: string };
+  videoDetails?: { videoId?: string; title?: string; author?: string; channelId?: string; lengthSeconds?: string };
+  captions?: {
+    playerCaptionsTracklistRenderer?: {
+      captionTracks?: CaptionTrack[];
+      audioTracks?: { captionTrackIndices?: number[]; defaultCaptionTrackIndex?: number }[];
+    };
+  };
+}
+
+function parseVideoId(input: string): string {
+  const raw = String(input ?? '').trim();
+  if (/^[A-Za-z0-9_-]{11}$/.test(raw)) return raw;
+  const m =
+    raw.match(/[?&]v=([A-Za-z0-9_-]{11})/) ??
+    raw.match(/youtu\.be\/([A-Za-z0-9_-]{11})/) ??
+    raw.match(/\/(?:shorts|embed|live|v)\/([A-Za-z0-9_-]{11})/);
+  if (m) return m[1];
+  throw new Error(`user_error: "${raw}" is not a YouTube video ID or URL. A video ID is 11 characters, e.g. "dQw4w9WgXcQ".`);
+}
+
+async function playerCall(
+  videoId: string,
+  client: (typeof PLAYER_CLIENTS)[number],
+  visitor?: WatchPage,
+): Promise<PlayerResponse> {
+  const headers: Record<string, string> = { 'content-type': 'application/json', 'user-agent': client.ua };
+  let context = client.context;
+  if (visitor) {
+    headers['x-goog-visitor-id'] = visitor.visitorData;
+    if (visitor.cookie) headers.cookie = visitor.cookie;
+    context = { ...context, visitorData: visitor.visitorData };
+  }
+  const res = await pwFetch(PLAYER_URL, { method: 'POST', headers, body: JSON.stringify({ context: { client: context }, videoId }) });
+  if (res.status === 429) throw new Error('upstream_throttled: YouTube rate-limited the transcript lookup (HTTP 429). Retry in a minute.');
+  if (!res.ok) throw new Error(`upstream_down: YouTube player endpoint returned HTTP ${res.status} for video ${videoId}.`);
+  return (await res.json()) as PlayerResponse;
+}
+
+interface WatchPage {
+  visitorData: string;
+  cookie: string;
+  /** The page itself says the video plays and lists no caption tracks. */
+  noCaptions: boolean;
+  title: string | null;
+}
+
+// The public watch page: no login, no forged identity — what any browser that
+// opened the video would get. It yields the visitor id + cookies a retry
+// carries, and it states on its own whether the video has caption tracks,
+// which settles captions_unavailable even when every player call is
+// bot-checked. Null when the page itself is refused (it answers 429 from some
+// egress IPs) — then it has told us nothing.
+async function fetchWatchPage(videoId: string): Promise<WatchPage | null> {
+  const res = await pwFetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    headers: { 'user-agent': BROWSER_UA, 'accept-language': 'en' },
+  });
+  if (!res.ok) return null;
+  const html = await res.text();
+  const visitorData = html.match(/"VISITOR_DATA":"([^"]+)"/)?.[1];
+  if (!visitorData) return null;
+  const setCookies = (res.headers as Headers & { getSetCookie?: () => string[] }).getSetCookie?.() ?? [];
+  const playable = html.match(/"playabilityStatus":\{"status":"([A-Z_]+)"/)?.[1] === 'OK';
+  const rawTitle = html.match(/<meta name="title" content="([^"]*)"/)?.[1];
+  const title = rawTitle
+    ? rawTitle.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+    : null;
+  return {
+    visitorData,
+    cookie: setCookies.map((c) => c.split(';')[0]).join('; '),
+    noCaptions: playable && !html.includes('"captionTracks"'),
+    title,
+  };
+}
+
+function isBotCheck(p: PlayerResponse): boolean {
+  return p.playabilityStatus?.status === 'LOGIN_REQUIRED' && /bot/i.test(p.playabilityStatus?.reason ?? '');
+}
+
+function captionsUnavailable(videoId: string, title: string | null | undefined): Error {
+  return new Error(
+    `not_found: captions_unavailable — video ${videoId}${title ? ` ("${title}")` : ''} has no captions: the uploader disabled them or YouTube generated none. There is no transcript to return.`,
+  );
+}
+
+async function resolvePlayer(videoId: string): Promise<PlayerResponse> {
+  let last: PlayerResponse | undefined;
+  for (const client of PLAYER_CLIENTS) {
+    last = await playerCall(videoId, client);
+    if (!isBotCheck(last)) return last;
+  }
+  const page = await fetchWatchPage(videoId);
+  if (page?.noCaptions) throw captionsUnavailable(videoId, page.title);
+  if (page) {
+    for (const client of PLAYER_CLIENTS) {
+      last = await playerCall(videoId, client, page);
+      if (!isBotCheck(last)) return last;
+    }
+  }
+  throw new Error(
+    `upstream_down: YouTube refused the transcript lookup from our servers ("${last?.playabilityStatus?.reason ?? 'bot check'}") on ${page ? 4 : 2} attempts. This is YouTube blocking datacenter traffic, not a problem with video ${videoId} — retry shortly.`,
+  );
+}
+
+function trackLabel(t: CaptionTrack): string {
+  return t.name?.simpleText ?? t.name?.runs?.map((r) => r.text).join('') ?? t.languageCode;
+}
+
+function pickTrack(player: PlayerResponse, lang: string | undefined): CaptionTrack {
+  const r = player.captions?.playerCaptionsTracklistRenderer;
+  const tracks = r?.captionTracks ?? [];
+  if (lang) {
+    const want = lang.toLowerCase();
+    const exact = tracks.filter((t) => t.languageCode.toLowerCase() === want);
+    const prefix = tracks.filter((t) => t.languageCode.toLowerCase().split('-')[0] === want.split('-')[0]);
+    const pool = exact.length ? exact : prefix;
+    // A human-made track beats the auto-generated one in the same language.
+    const hit = pool.find((t) => t.kind !== 'asr') ?? pool[0];
+    if (hit) return hit;
+    throw new Error(
+      `not_found: captions_unavailable — video ${player.videoDetails?.videoId ?? ''} has no caption track in "${lang}". ` +
+        `Available: ${tracks.map((t) => `${t.languageCode}${t.kind === 'asr' ? ' (auto-generated)' : ''}`).join(', ')}. Call again with one of those as lang.`,
+    );
+  }
+  const audio = r?.audioTracks?.[0];
+  const idx = audio?.defaultCaptionTrackIndex ?? audio?.captionTrackIndices?.[0];
+  if (idx !== undefined && tracks[idx]) return tracks[idx];
+  return tracks.find((t) => t.kind !== 'asr') ?? tracks[0];
+}
+
+async function videoTranscript(input: string, lang?: string, startSeconds?: number, maxChars?: number) {
+  const videoId = parseVideoId(input);
+  const player = await resolvePlayer(videoId);
+  const status = player.playabilityStatus?.status;
+  const reason = player.playabilityStatus?.reason ?? '';
+  if (status !== 'OK') {
+    // Private, removed, age-gated or region-blocked — the caller named a video
+    // whose captions nobody without a login can read.
+    throw new Error(`not_found: YouTube video ${videoId} is not publicly playable (${status ?? 'no status'}${reason ? `: ${reason}` : ''}).`);
+  }
+  const tracks = player.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+  if (tracks.length === 0) throw captionsUnavailable(videoId, player.videoDetails?.title);
+  const track = pickTrack(player, lang);
+  const url = `${track.baseUrl.replace(/&fmt=[^&]*/, '')}&fmt=json3`;
+  const res = await pwFetch(url, { headers: { 'user-agent': BROWSER_UA } });
+  if (res.status === 429) throw new Error('upstream_throttled: YouTube rate-limited the caption download (HTTP 429). Retry in a minute.');
+  if (!res.ok) throw new Error(`upstream_down: YouTube caption endpoint returned HTTP ${res.status} for video ${videoId}.`);
+  const body = await res.text();
+  if (!body.trim()) {
+    throw new Error(`upstream_down: YouTube returned an empty caption file for video ${videoId} (${track.languageCode}) — the track exists but the download was refused.`);
+  }
+  const data = JSON.parse(body) as { events?: { tStartMs?: number; dDurationMs?: number; segs?: { utf8?: string }[] }[] };
+
+  const all = (data.events ?? [])
+    .filter((e) => e.segs)
+    .map((e) => ({
+      start: (e.tStartMs ?? 0) / 1000,
+      duration: (e.dDurationMs ?? 0) / 1000,
+      text: (e.segs ?? []).map((g) => g.utf8 ?? '').join('').replace(/\s+/g, ' ').trim(),
+    }))
+    .filter((s) => s.text);
+  if (all.length === 0) {
+    throw new Error(`not_found: captions_unavailable — the ${track.languageCode} caption track of video ${videoId} contains no text.`);
+  }
+
+  const from = Math.max(0, Number(startSeconds) || 0);
+  const cap = Math.min(Math.max(1000, Number(maxChars) || TRANSCRIPT_MAX_CHARS_DEFAULT), TRANSCRIPT_MAX_CHARS_CAP);
+  const segments: { start_seconds: number; duration_seconds: number; text: string }[] = [];
+  let chars = 0;
+  let nextStart: number | null = null;
+  for (const s of all) {
+    if (s.start < from) continue;
+    if (chars + s.text.length > cap && segments.length > 0) {
+      nextStart = s.start;
+      break;
+    }
+    segments.push({ start_seconds: Math.round(s.start * 100) / 100, duration_seconds: Math.round(s.duration * 100) / 100, text: s.text });
+    chars += s.text.length + 1;
+  }
+  if (segments.length === 0) {
+    throw new Error(`user_error: start_seconds ${from} is past the end of the transcript (last segment starts at ${Math.floor(all[all.length - 1].start)}s).`);
+  }
+
+  const v = player.videoDetails ?? {};
+  return {
+    video_id: videoId,
+    title: v.title ?? null,
+    channel: v.author ?? null,
+    channel_id: v.channelId ?? null,
+    length_seconds: v.lengthSeconds ? Number(v.lengthSeconds) : null,
+    language: track.languageCode,
+    language_name: trackLabel(track),
+    auto_generated: track.kind === 'asr',
+    available_tracks: tracks.map((t) => ({ language: t.languageCode, name: trackLabel(t), auto_generated: t.kind === 'asr' })),
+    segment_count: segments.length,
+    total_segments: all.length,
+    truncated: nextStart !== null,
+    next_start_seconds: nextStart,
+    text: segments.map((s) => s.text).join(' '),
+    segments,
+    source: `https://www.youtube.com/watch?v=${videoId}`,
+  };
+}
+
 // ── callTool dispatcher ──────────────────────────────────────────────
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  // Keyless: reads YouTube's public player + caption endpoints, not the Data API.
+  if (name === 'yt_video_transcript') {
+    return videoTranscript(
+      args.video_id as string,
+      args.lang as string | undefined,
+      args.start_seconds as number | undefined,
+      args.max_chars as number | undefined,
+    );
+  }
+
   const apiKey = extractKey(args);
 
   switch (name) {
