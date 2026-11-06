@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-youtube",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "YouTube MCP — wraps the YouTube Data API v3 (BYO API key)",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "youtube",
     "gatewaySlug": "youtube",
-    "sourceHash": "v1-2a0ffba204d9179068424cbc9f17e12d2717af069a4a2c2ab65340c2c584833b",
-    "sourceCommit": "98853f34516646cb7c4c1460f09249b262c0269e"
+    "sourceHash": "v1-6826b97bde88d673755761be469b0a10ba9db442f3ecd5b890d73f54e5270752",
+    "sourceCommit": "78b905fa3a6880dfb85c79150f4bffe8cf50ef00"
   }
 }
